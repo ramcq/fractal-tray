@@ -13,7 +13,8 @@
         "--socket=fallback-x11",
         "--socket=wayland",
         "--socket=pulseaudio",
-        "--device=dri"
+        "--device=dri",
+        "--talk-name=org.kde.StatusNotifierWatcher"
     ],
     "build-options": {
         "append-path": "/usr/lib/sdk/rust-stable/bin"
@@ -95,6 +96,10 @@
                         "cat cargo/config >> .cargo/config.toml",
                         "cat .cargo/config.toml"
                     ]
+                },
+                {
+                    "type": "patch",
+                    "path": "tray-icon.patch"
                 }
             ]
         }

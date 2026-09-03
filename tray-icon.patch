@@ -1,0 +1,771 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 458c817..e282d24 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1187,6 +1187,7 @@ dependencies = [
+  "gstreamer-video",
+  "gtk4",
+  "indexmap",
++ "ksni",
+  "libadwaita",
+  "libglycin-gtk4-rebind",
+  "libglycin-rebind",
+@@ -2498,6 +2499,19 @@ dependencies = [
+  "typewit",
+ ]
+ 
++[[package]]
++name = "ksni"
++version = "0.3.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "814b44c24cd2cb236c3b8a41c7f08237b452a8e76ecaa81f1cec40b5b678215b"
++dependencies = [
++ "futures-util",
++ "pastey",
++ "serde",
++ "tokio",
++ "zbus",
++]
++
+ [[package]]
+ name = "kstring"
+ version = "2.0.2"
+diff --git a/Cargo.toml b/Cargo.toml
+index 8f12170..14f9a54 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -127,6 +127,7 @@ ashpd = { version = "0.13.9", default-features = false, features = [
+     "tracing",
+     "tokio",
+ ] }
++ksni = "0.3.6"
+ oo7 = { version = "0.6", default-features = false, features = [
+     "native_crypto",
+     "tokio",
+diff --git a/data/org.gnome.Fractal.desktop.in.in b/data/org.gnome.Fractal.desktop.in.in
+index 81f2141..6189ed7 100644
+--- a/data/org.gnome.Fractal.desktop.in.in
++++ b/data/org.gnome.Fractal.desktop.in.in
+@@ -1,5 +1,5 @@
+ [Desktop Entry]
+-Name=Fractal
++Name=Fractal (Tray)
+ Comment=Fractal is a decentralized, secure messaging client for collaborative group communication.
+ GenericName=Fractal group messaging
+ Exec=fractal %U
+diff --git a/data/org.gnome.Fractal.gschema.xml.in b/data/org.gnome.Fractal.gschema.xml.in
+index 9ff8c30..6badec0 100644
+--- a/data/org.gnome.Fractal.gschema.xml.in
++++ b/data/org.gnome.Fractal.gschema.xml.in
+@@ -18,6 +18,11 @@
+       <summary>Enable markdown formatting</summary>
+       <description>Whether messages should be processed as markdown when sending them</description>
+     </key>
++    <key name="run-in-background" type="b">
++      <default>true</default>
++      <summary>Run in the background</summary>
++      <description>Whether to show an icon in the system tray and keep running when the window is closed</description>
++    </key>
+     <key name="sessions" type="s">
+       <default>'[]'</default>
+       <summary>Session settings</summary>
+diff --git a/src/application.rs b/src/application.rs
+index 4c6c236..c271bee 100644
+--- a/src/application.rs
++++ b/src/application.rs
+@@ -14,11 +14,14 @@ use crate::{
+     spawn,
+     system_settings::SystemSettings,
+     toast,
++    tray::TrayIcon,
+     utils::{BoundObjectWeakRef, LoadingState, matrix::MatrixIdUri},
+ };
+ 
+ /// The key for the current session setting.
+ pub(crate) const SETTINGS_KEY_CURRENT_SESSION: &str = "current-session";
++/// The key for the run in the background setting.
++pub(crate) const SETTINGS_KEY_RUN_IN_BACKGROUND: &str = "run-in-background";
+ /// The name of the application.
+ pub(crate) const APP_NAME: &str = "Fractal";
+ /// The URL of the homepage of the application.
+@@ -39,6 +42,10 @@ mod imp {
+         pub(super) session_list: SessionList,
+         intent_handler: BoundObjectWeakRef<glib::Object>,
+         last_network_state: Cell<NetworkState>,
++        /// The tray icon, when running in the background is enabled.
++        tray_icon: RefCell<Option<TrayIcon>>,
++        /// Whether the application is in the process of quitting.
++        is_quitting: Cell<bool>,
+     }
+ 
+     impl Default for Application {
+@@ -49,6 +56,8 @@ mod imp {
+                 session_list: Default::default(),
+                 intent_handler: Default::default(),
+                 last_network_state: Default::default(),
++                tray_icon: Default::default(),
++                is_quitting: Default::default(),
+             }
+         }
+     }
+@@ -122,6 +131,19 @@ mod imp {
+ 
+             // Set icons for shell
+             gtk::Window::set_default_icon_name(crate::APP_ID);
++
++            // Set up the tray icon and follow the changes of the setting.
++            self.update_tray_icon();
++            self.settings.connect_changed(
++                Some(SETTINGS_KEY_RUN_IN_BACKGROUND),
++                clone!(
++                    #[weak(rename_to = imp)]
++                    self,
++                    move |_, _| {
++                        imp.update_tray_icon();
++                    }
++                ),
++            );
+         }
+ 
+         fn open(&self, files: &[gio::File], _hint: &str) {
+@@ -145,11 +167,22 @@ mod imp {
+     impl AdwApplicationImpl for Application {}
+ 
+     impl Application {
++        /// The main window, if it was constructed.
++        ///
++        /// Unlike `active_window()`, this also returns the window when it is
++        /// hidden in the tray.
++        fn main_window(&self) -> Option<Window> {
++            self.obj()
++                .windows()
++                .into_iter()
++                .find_map(|window| window.downcast::<Window>().ok())
++        }
++
+         /// Get or create the main window and make sure it is visible.
+         ///
+         /// Returns the main window.
+-        fn present_main_window(&self) -> Window {
+-            let window = if let Some(window) = self.obj().active_window().and_downcast() {
++        pub(super) fn present_main_window(&self) -> Window {
++            let window = if let Some(window) = self.main_window() {
+                 window
+             } else {
+                 Window::new(&self.obj())
+@@ -159,19 +192,66 @@ mod imp {
+             window
+         }
+ 
++        /// Show the main window, or hide it in the tray if it is visible.
++        pub(super) fn toggle_main_window(&self) {
++            if let Some(window) = self.main_window().filter(|window| window.is_visible()) {
++                window.close();
++            } else {
++                self.present_main_window();
++            }
++        }
++
++        /// Quit the application.
++        pub(super) fn quit_application(&self) {
++            // Do not hide the window in the tray, we are going away.
++            self.is_quitting.set(true);
++
++            if let Some(window) = self.main_window() {
++                // This is needed to trigger the close request and save the window state.
++                window.close();
++            }
++
++            self.obj().quit();
++        }
++
++        /// Whether the main window should be hidden in the tray instead of
++        /// being closed.
++        pub(super) fn should_hide_main_window(&self) -> bool {
++            !self.is_quitting.get()
++                && self
++                    .tray_icon
++                    .borrow()
++                    .as_ref()
++                    .is_some_and(TrayIcon::is_registered)
++        }
++
++        /// Create or destroy the tray icon, according to the setting.
++        fn update_tray_icon(&self) {
++            let enabled = self.settings.boolean(SETTINGS_KEY_RUN_IN_BACKGROUND);
++
++            if enabled == self.tray_icon.borrow().is_some() {
++                return;
++            }
++
++            if enabled {
++                self.tray_icon.replace(Some(TrayIcon::new()));
++            } else {
++                self.tray_icon.take();
++
++                // Without the tray, there would be no way to show the window again.
++                if self.main_window().is_some_and(|window| !window.is_visible()) {
++                    self.present_main_window();
++                }
++            }
++        }
++
+         /// Set up the application actions.
+         fn set_up_gactions(&self) {
+             self.obj().add_action_entries([
+                 // Quit
+                 gio::ActionEntry::builder("quit")
+                     .activate(|obj: &super::Application, _, _| {
+-                        if let Some(window) = obj.active_window() {
+-                            // This is needed to trigger the close request and save the window
+-                            // state.
+-                            window.close();
+-                        }
+-
+-                        obj.quit();
++                        obj.imp().quit_application();
+                     })
+                     .build(),
+                 // About
+@@ -227,6 +307,11 @@ mod imp {
+                     })
+                     .build(),
+             ]);
++
++            // Run in the background, i.e. show a tray icon and keep running when the
++            // window is closed. This action is stateful and backed by the setting.
++            self.obj()
++                .add_action(&self.settings.create_action(SETTINGS_KEY_RUN_IN_BACKGROUND));
+         }
+ 
+         /// Sets up keyboard shortcuts for application and window actions.
+@@ -501,6 +586,29 @@ impl Application {
+         &self.imp().session_list
+     }
+ 
++    /// Get or create the main window and make sure it is visible.
++    ///
++    /// Returns the main window.
++    pub(crate) fn present_main_window(&self) -> Window {
++        self.imp().present_main_window()
++    }
++
++    /// Show the main window, or hide it in the tray if it is visible.
++    pub(crate) fn toggle_main_window(&self) {
++        self.imp().toggle_main_window();
++    }
++
++    /// Quit the application.
++    pub(crate) fn quit_application(&self) {
++        self.imp().quit_application();
++    }
++
++    /// Whether the main window should be hidden in the tray instead of being
++    /// closed.
++    pub(crate) fn should_hide_main_window(&self) -> bool {
++        self.imp().should_hide_main_window()
++    }
++
+     /// Run Fractal.
+     pub(crate) fn run(&self) {
+         info!("Fractal ({})", config::APP_ID);
+diff --git a/src/main.rs b/src/main.rs
+index 992feb2..02f4f0f 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -22,6 +22,7 @@ mod session;
+ mod session_list;
+ mod session_view;
+ mod system_settings;
++mod tray;
+ mod user_facing_error;
+ mod utils;
+ mod window;
+diff --git a/src/prelude.rs b/src/prelude.rs
+index 36225eb..b35fe88 100644
+--- a/src/prelude.rs
++++ b/src/prelude.rs
+@@ -6,6 +6,7 @@ pub(crate) use crate::{
+     secret::SecretExt,
+     session::{TimelineItemExt, UserExt},
+     session_list::SessionInfoExt,
++    tray::TrayIconExt,
+     user_facing_error::UserFacingError,
+     utils::{
+         ChildPropertyExt, IsABin, LocationExt,
+diff --git a/src/session_view/sidebar/mod.blp b/src/session_view/sidebar/mod.blp
+index 32a2a55..ea55673 100644
+--- a/src/session_view/sidebar/mod.blp
++++ b/src/session_view/sidebar/mod.blp
+@@ -19,6 +19,13 @@ menu primary_menu {
+     }
+   }
+ 
++  section {
++    item {
++      label: _("Run in _Background");
++      action: "app.run-in-background";
++    }
++  }
++
+   section {
+     item {
+       label: _("_Keyboard Shortcuts");
+diff --git a/src/tray/linux.rs b/src/tray/linux.rs
+new file mode 100644
+index 0000000..ae16a7f
+--- /dev/null
++++ b/src/tray/linux.rs
+@@ -0,0 +1,381 @@
++//! Tray icon backend using the `StatusNotifierItem` specification.
++//!
++//! It is implemented natively by KDE Plasma, and on GNOME Shell by the
++//! AppIndicator extension.
++
++use futures_channel::mpsc::{UnboundedSender, unbounded};
++use futures_util::StreamExt;
++use gettextrs::gettext;
++use gtk::{gdk, gio, glib, glib::clone, prelude::*, subclass::prelude::*};
++use ksni::{
++    Category, Icon, Status, ToolTip, TrayMethods,
++    menu::{MenuItem, StandardItem},
++};
++use tracing::{debug, error, warn};
++
++use super::TrayIconExt;
++use crate::{
++    APP_NAME, Application, config, ngettext_f,
++    session::{Room, Session},
++    spawn, spawn_tokio,
++    utils::ExpressionListModel,
++};
++
++/// The path of the application icon in the resources.
++///
++/// The name of the file does not depend on the profile that was built.
++const ICON_RESOURCE_PATH: &str = "/org/gnome/Fractal/icons/scalable/apps/org.gnome.Fractal.svg";
++
++/// A request made by the user through the tray icon.
++#[derive(Debug, Clone, Copy)]
++enum TrayRequest {
++    /// Show the window, or hide it if it is already visible.
++    ToggleWindow,
++    /// Show the window.
++    ShowWindow,
++    /// Quit the application.
++    Quit,
++}
++
++/// Process the given request from the tray icon.
++fn process_request(request: TrayRequest) {
++    let app = Application::default();
++
++    match request {
++        TrayRequest::ToggleWindow => app.toggle_main_window(),
++        TrayRequest::ShowWindow => {
++            app.present_main_window();
++        }
++        TrayRequest::Quit => app.quit_application(),
++    }
++}
++
++/// Load the application icon as an ARGB32 image.
++///
++/// This is only used as a fallback for trays that cannot find our icon by
++/// name, which should not happen when the icon is installed on the system.
++fn load_icon() -> Option<Icon> {
++    let bytes = gio::resources_lookup_data(ICON_RESOURCE_PATH, gio::ResourceLookupFlags::NONE)
++        .inspect_err(|error| warn!("Could not load the tray icon from the resources: {error}"))
++        .ok()?;
++    let texture = gdk::Texture::from_bytes(&bytes)
++        .inspect_err(|error| warn!("Could not decode the tray icon: {error}"))
++        .ok()?;
++
++    let mut downloader = gdk::TextureDownloader::new(&texture);
++    // We need straight, i.e. not premultiplied, RGBA to convert to ARGB32.
++    downloader.set_format(gdk::MemoryFormat::R8g8b8a8);
++    let (pixels, stride) = downloader.download_bytes();
++
++    let width = texture.width();
++    let height = texture.height();
++    let mut data = Vec::with_capacity(width as usize * height as usize * 4);
++
++    for row in 0..height as usize {
++        for column in 0..width as usize {
++            let offset = row * stride + column * 4;
++
++            let Some(&[red, green, blue, alpha]) = pixels.get(offset..offset + 4) else {
++                error!("Tray icon pixel data is shorter than the texture");
++                return None;
++            };
++
++            // ARGB32 in network, i.e. big-endian, byte order.
++            data.extend_from_slice(&[alpha, red, green, blue]);
++        }
++    }
++
++    Some(Icon {
++        width,
++        height,
++        data,
++    })
++}
++
++/// The `StatusNotifierItem` representing the application in the tray.
++struct TrayItem {
++    /// The channel to send the requests of the user to the main thread.
++    sender: UnboundedSender<TrayRequest>,
++    /// The application icon, if it could be loaded.
++    icon: Option<Icon>,
++    /// The number of notifications pending across all the sessions.
++    notification_count: u64,
++}
++
++impl TrayItem {
++    /// Send the given request to the main thread.
++    fn request(&self, request: TrayRequest) {
++        if self.sender.unbounded_send(request).is_err() {
++            warn!("Could not send tray request: the application is not listening anymore");
++        }
++    }
++}
++
++impl ksni::Tray for TrayItem {
++    fn id(&self) -> String {
++        config::APP_ID.to_owned()
++    }
++
++    fn title(&self) -> String {
++        APP_NAME.to_owned()
++    }
++
++    fn category(&self) -> Category {
++        Category::Communications
++    }
++
++    fn status(&self) -> Status {
++        if self.notification_count > 0 {
++            Status::NeedsAttention
++        } else {
++            Status::Active
++        }
++    }
++
++    fn icon_name(&self) -> String {
++        config::APP_ID.to_owned()
++    }
++
++    fn attention_icon_name(&self) -> String {
++        config::APP_ID.to_owned()
++    }
++
++    fn icon_pixmap(&self) -> Vec<Icon> {
++        self.icon.clone().into_iter().collect()
++    }
++
++    fn attention_icon_pixmap(&self) -> Vec<Icon> {
++        self.icon_pixmap()
++    }
++
++    fn tool_tip(&self) -> ToolTip {
++        let description = if self.notification_count > 0 {
++            ngettext_f(
++                // Translators: Do NOT translate the content between '{' and '}', this is a
++                // variable name.
++                "{count} unread notification",
++                "{count} unread notifications",
++                self.notification_count.try_into().unwrap_or(u32::MAX),
++                &[("count", &self.notification_count.to_string())],
++            )
++        } else {
++            gettext("No unread notifications")
++        };
++
++        ToolTip {
++            icon_name: config::APP_ID.to_owned(),
++            icon_pixmap: self.icon_pixmap(),
++            title: APP_NAME.to_owned(),
++            description,
++        }
++    }
++
++    fn menu(&self) -> Vec<MenuItem<Self>> {
++        vec![
++            StandardItem {
++                label: gettext("_Show Fractal"),
++                activate: Box::new(|item: &mut Self| item.request(TrayRequest::ShowWindow)),
++                ..Default::default()
++            }
++            .into(),
++            MenuItem::Separator,
++            StandardItem {
++                label: gettext("_Quit"),
++                activate: Box::new(|item: &mut Self| item.request(TrayRequest::Quit)),
++                ..Default::default()
++            }
++            .into(),
++        ]
++    }
++
++    fn activate(&mut self, _x: i32, _y: i32) {
++        self.request(TrayRequest::ToggleWindow);
++    }
++}
++
++mod imp {
++    use std::cell::{Cell, RefCell};
++
++    use super::*;
++
++    #[derive(Default)]
++    pub struct LinuxTrayIcon {
++        /// The handle to the running tray service.
++        pub(super) handle: RefCell<Option<ksni::Handle<TrayItem>>>,
++        /// The models watching the notification count of the rooms of every
++        /// session.
++        room_models: RefCell<Vec<ExpressionListModel>>,
++        /// The notification count that was last sent to the tray.
++        notification_count: Cell<u64>,
++    }
++
++    #[glib::object_subclass]
++    impl ObjectSubclass for LinuxTrayIcon {
++        const NAME: &'static str = "TrayIcon";
++        type Type = super::LinuxTrayIcon;
++    }
++
++    impl ObjectImpl for LinuxTrayIcon {
++        fn constructed(&self) {
++            self.parent_constructed();
++
++            self.start_service();
++            self.watch_sessions();
++        }
++
++        fn dispose(&self) {
++            if let Some(handle) = self.handle.take() {
++                let _ = handle.shutdown();
++            }
++        }
++    }
++
++    impl LinuxTrayIcon {
++        /// Start the tray service.
++        fn start_service(&self) {
++            let (sender, mut receiver) = unbounded();
++            let item = TrayItem {
++                sender,
++                icon: load_icon(),
++                notification_count: 0,
++            };
++
++            spawn!(clone!(
++                #[weak(rename_to = imp)]
++                self,
++                async move {
++                    // A sandboxed application cannot own the well-known D-Bus name that
++                    // the specification asks for, it must register with its unique name.
++                    let is_sandboxed = ashpd::is_sandboxed();
++
++                    let result =
++                        spawn_tokio!(
++                            async move { item.disable_dbus_name(is_sandboxed).spawn().await }
++                        )
++                        .await
++                        .expect("task was not aborted");
++
++                    match result {
++                        Ok(handle) => {
++                            debug!("Registered the tray icon");
++                            imp.handle.replace(Some(handle));
++                            // The notification count might have been computed while the
++                            // service was starting.
++                            imp.send_notification_count();
++                        }
++                        Err(error) => {
++                            warn!("Could not register the tray icon: {error}");
++                        }
++                    }
++                }
++            ));
++
++            // The requests of the user are processed on the main thread.
++            spawn!(async move {
++                while let Some(request) = receiver.next().await {
++                    process_request(request);
++                }
++
++                debug!("The tray icon service stopped");
++            });
++        }
++
++        /// Watch the sessions to keep track of the number of pending
++        /// notifications.
++        fn watch_sessions(&self) {
++            let app = Application::default();
++            app.session_list().connect_items_changed(clone!(
++                #[weak(rename_to = imp)]
++                self,
++                move |_, _, _, _| {
++                    imp.watch_rooms();
++                }
++            ));
++
++            self.watch_rooms();
++        }
++
++        /// Watch the rooms of every session to keep track of the number of
++        /// pending notifications.
++        fn watch_rooms(&self) {
++            let mut room_models = Vec::new();
++
++            let app = Application::default();
++
++            for session in app.session_list().iter::<glib::Object>() {
++                let Some(session) = session.ok().and_downcast::<Session>() else {
++                    continue;
++                };
++
++                let room_model = ExpressionListModel::new();
++                room_model
++                    .set_expressions(vec![Room::this_expression("notification-count").upcast()]);
++                room_model.connect_items_changed(clone!(
++                    #[weak(rename_to = imp)]
++                    self,
++                    move |_, _, _, _| {
++                        imp.update_notification_count();
++                    }
++                ));
++                room_model.set_model(Some(session.room_list()));
++
++                room_models.push(room_model);
++            }
++
++            self.room_models.replace(room_models);
++            self.update_notification_count();
++        }
++
++        /// Update the number of pending notifications across all the sessions.
++        fn update_notification_count(&self) {
++            let room_models = self.room_models.borrow();
++            let notification_count = room_models
++                .iter()
++                .flat_map(|room_model| room_model.iter::<glib::Object>())
++                .filter_map(|room| room.ok().and_downcast::<Room>())
++                .map(|room| room.notification_count())
++                .sum();
++            drop(room_models);
++
++            if self.notification_count.get() == notification_count {
++                return;
++            }
++
++            self.notification_count.set(notification_count);
++            self.send_notification_count();
++        }
++
++        /// Send the current number of pending notifications to the tray.
++        pub(super) fn send_notification_count(&self) {
++            let Some(handle) = self.handle.borrow().clone() else {
++                return;
++            };
++
++            let notification_count = self.notification_count.get();
++            spawn_tokio!(async move {
++                let _ = handle
++                    .update(|item: &mut TrayItem| item.notification_count = notification_count)
++                    .await;
++            });
++        }
++    }
++}
++
++glib::wrapper! {
++    /// A tray icon using the `StatusNotifierItem` specification.
++    pub struct LinuxTrayIcon(ObjectSubclass<imp::LinuxTrayIcon>);
++}
++
++impl TrayIconExt for LinuxTrayIcon {
++    fn new() -> Self {
++        glib::Object::new()
++    }
++
++    fn is_registered(&self) -> bool {
++        self.imp()
++            .handle
++            .borrow()
++            .as_ref()
++            .is_some_and(|handle| !handle.is_closed())
++    }
++}
+diff --git a/src/tray/mod.rs b/src/tray/mod.rs
+new file mode 100644
+index 0000000..4f570cf
+--- /dev/null
++++ b/src/tray/mod.rs
+@@ -0,0 +1,48 @@
++//! System tray icon API.
++//!
++//! A tray icon allows the application to keep running with its window hidden,
++//! and gives the user a way to bring the window back.
++
++#[cfg(target_os = "linux")]
++mod linux;
++
++cfg_if::cfg_if! {
++    if #[cfg(target_os = "linux")] {
++        /// The tray icon API.
++        pub(crate) type TrayIcon = linux::LinuxTrayIcon;
++    } else {
++        /// The tray icon API.
++        pub(crate) type TrayIcon = unimplemented::UnimplementedTrayIcon;
++    }
++}
++
++/// Trait implemented by tray icon backends.
++pub(crate) trait TrayIconExt {
++    /// Construct a tray icon and start registering it with the system.
++    fn new() -> Self;
++
++    /// Whether the tray icon is registered with the system.
++    ///
++    /// While it is not, the window must not be hidden, or the user would have
++    /// no way to bring it back.
++    fn is_registered(&self) -> bool;
++}
++
++/// The fallback tray icon API, used on platforms where it is unimplemented.
++#[cfg(not(target_os = "linux"))]
++mod unimplemented {
++    use super::*;
++
++    #[derive(Debug)]
++    pub(crate) struct UnimplementedTrayIcon;
++
++    impl TrayIconExt for UnimplementedTrayIcon {
++        fn new() -> Self {
++            Self
++        }
++
++        fn is_registered(&self) -> bool {
++            false
++        }
++    }
++}
+diff --git a/src/window.rs b/src/window.rs
+index 3340b8e..dc3ab04 100644
+--- a/src/window.rs
++++ b/src/window.rs
+@@ -227,6 +227,12 @@ mod imp {
+                 warn!("Could not save current session: {error}");
+             }
+ 
++            if Application::default().should_hide_main_window() {
++                // Keep running in the background, the tray icon can bring us back.
++                self.obj().set_visible(false);
++                return glib::Propagation::Stop;
++            }
++
+             glib::Propagation::Proceed
+         }
+     }

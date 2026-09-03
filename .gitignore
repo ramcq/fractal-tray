@@ -1,0 +1,4 @@
+fractal-tray.flatpak
+build-dir/
+repo/
+.flatpak-builder/
