@@ -112,18 +112,30 @@ jobs:
               repo
           du -sh repo
 
-      - name: Write index.flatpakrepo
+      # A .flatpakref, not a .flatpakrepo, so installing sets the remote up as a
+      # filtered origin: flatpak gives it xa.noenumerate=true, xa.prio=0 and
+      # xa.main-ref, so it can never offer anything but this one ref and never
+      # wins a dependency search. Deliberately no SuggestRemoteName: setting it
+      # diverts flatpak to creating a plain enumerable remote instead, losing
+      # the filter. RuntimeRepo is required because a no-enumerate remote is
+      # skipped when resolving the runtime.
+      - name: Write the flatpakref
         if: github.event_name == 'push'
         run: |
-          cat > repo/index.flatpakrepo <<EOF
-          [Flatpak Repo]
+          cat > "repo/$APP_ID.flatpakref" <<EOF
+          [Flatpak Ref]
+          Version=1
+          Name=$APP_ID
+          Branch=$BRANCH
           Title=Fractal (Tray)
           Url=https://ramcq.github.io/fractal-tray/
           Homepage=https://github.com/ramcq/fractal-tray
           Comment=Unofficial Fractal rebuild with a system tray icon
           Description=Unofficial rebuild of the Fractal Matrix client with a StatusNotifierItem tray icon. Not affiliated with the Fractal project or GNOME.
+          RuntimeRepo=$RUNTIME_REPO
           GPGKey=$(base64 --wrap=0 < fractal-tray.gpg)
           EOF
+          sed 's/^GPGKey=.\{0,24\}.*/GPGKey=<base64>/' "repo/$APP_ID.flatpakref"
           # Stop Pages' Jekyll from eating the ostree directories.
           touch repo/.nojekyll
 
@@ -144,14 +156,13 @@ jobs:
             --title "Fractal $VERSION (tray)" \
             --notes "Unofficial rebuild of Fractal $VERSION with a system tray icon.
 
-          Install this bundle directly:
+          Install and track updates (one command, adds a filtered origin remote):
+
+              flatpak install --user https://ramcq.github.io/fractal-tray/org.gnome.Fractal.flatpakref
+
+          Or install this bundle directly, without a remote and so without updates:
 
               flatpak install --user fractal-tray.flatpak
-
-          Or add the remote, which supports \`flatpak update\`:
-
-              flatpak remote-add --user --if-not-exists fractal-tray https://ramcq.github.io/fractal-tray/index.flatpakrepo
-              flatpak install --user fractal-tray org.gnome.Fractal
 
           Not affiliated with the Fractal project or GNOME."
 

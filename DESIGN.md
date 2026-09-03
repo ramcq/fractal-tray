@@ -106,6 +106,38 @@ only; rollback is served by `.flatpak` bundles attached to releases, which is
 both simpler and more useful than ostree history a reader would have to pin by
 commit.
 
+## Install surface: a flatpakref, not a flatpakrepo
+
+The published entry point is `org.gnome.Fractal.flatpakref`. Installing from it
+makes flatpak create the remote as an *origin* remote:
+
+```
+xa.noenumerate=true
+xa.prio=0
+xa.main-ref=app/org.gnome.Fractal/x86_64/stable
+```
+
+Per `flatpak-remote(5)`, `noenumerate` means the remote is "ignored when
+presenting available apps/runtimes, or when searching for a runtime dependency".
+So the remote can only ever serve this one ref, never wins a dependency search,
+and stays out of software-source listings. `flatpak update` still works — this
+was verified, not assumed.
+
+Two non-obvious constraints, both established empirically:
+
+* **`SuggestRemoteName` must be omitted.** Setting it diverts flatpak to creating
+  an ordinary enumerable remote with no filter at all. The cost of leaving it out
+  is that the remote is auto-named `fractal-origin` rather than something tidier.
+  The filter was judged worth more than the name.
+* **`RuntimeRepo` is required**, precisely because a `no-enumerate` remote is
+  skipped when resolving the runtime — so the GNOME 50 runtime has to be
+  reachable from Flathub.
+
+A `.flatpakrepo` cannot achieve this. It does have a `Filter` key, but that is
+documented as "the path of a **local** file", intended for remotes
+preconfigured under `/usr/share/flatpak/remotes.d/`, so it cannot deliver a
+filter to someone downloading the file over the web.
+
 ## Tracking upstream
 
 `poll.yml`, triggered by **`workflow_dispatch` only**. GitHub's 60-day

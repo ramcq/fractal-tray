@@ -84,14 +84,18 @@ gh run list --repo ramcq/fractal-tray --workflow track-upstream.yml --limit 3
 ## 5. Switch your install over
 
 You currently have the bundle installed as branch `master` from
-`fractal-origin`. The remote publishes `stable`, matching Flathub's ref:
+`fractal-origin`, plus a `fractal-tray` remote that a verification step of mine
+added. Clear both, then install from the flatpakref:
 
 ```sh
 flatpak uninstall --user org.gnome.Fractal
-flatpak remote-add --user --if-not-exists \
-    fractal-tray https://ramcq.github.io/fractal-tray/index.flatpakrepo
-flatpak install --user fractal-tray org.gnome.Fractal
+flatpak remote-delete --user fractal-tray
+flatpak install --user https://ramcq.github.io/fractal-tray/org.gnome.Fractal.flatpakref
 ```
+
+The install adds the remote itself, as a filtered origin (`no-enumerate`, pinned
+to this one ref). Note it will be named `fractal-origin`, which is also the name
+the old bundle install used — hence removing that first.
 
 Your session and E2EE device survive: app data lives in
 `~/.var/app/org.gnome.Fractal`, keyed on app ID, which has not changed.

@@ -51,10 +51,16 @@ unless there is a tray icon to bring it back from.
 ## Install
 
 ```sh
-flatpak remote-add --user --if-not-exists \
-    fractal-tray https://ramcq.github.io/fractal-tray/index.flatpakrepo
-flatpak install --user fractal-tray org.gnome.Fractal
+flatpak install --user https://ramcq.github.io/fractal-tray/org.gnome.Fractal.flatpakref
 ```
+
+One command: it adds the remote, pulls the GNOME runtime from Flathub if needed,
+and installs the app. Updates then arrive through `flatpak update` as usual.
+
+The remote is added as a **filtered origin** — flatpak marks it
+`no-enumerate` with `xa.main-ref` pinned to this one ref and `xa.prio=0`. So it
+can only ever offer this build, it is never consulted when resolving some other
+app's runtime, and it does not clutter your list of software sources.
 
 This publishes app ID `org.gnome.Fractal` on branch `stable` — the same ref as
 Flathub — so it is a drop-in replacement and keeps your existing session and
