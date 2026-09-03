@@ -88,7 +88,14 @@ x86_64 only. No build cache: GitHub evicts caches after 7 days unused while
 releases are months apart, so it would be cold every time — and the dominant cost
 is `cargo build --release` of one opaque module, which caching cannot touch
 without `sccache` and a manifest that diverges from the one Flathub can build.
-Expect ~2 hours; free on a public repository.
+The 10 GB cache-service quota is a separate limit from runner disk, so ample disk
+does not change this.
+
+Measured, not estimated: a full run is **~30 minutes** — 79 s to pull the 5.8 GB
+image, 19 s for the SDK extension, 27 m 18 s for all four modules including the
+cargo release build, ~45 s to bundle, sign and publish. Free on a public
+repository. At that duration a cold restore of ~5 GB of cache could plausibly
+cost more than it saves.
 
 Publish is inlined shell rather than a third-party action: `build-export` →
 `build-update-repo --prune --prune-depth=0` → `index.flatpakrepo` →
