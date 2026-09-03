@@ -42,7 +42,10 @@ jobs:
       - name: Install flatpak
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+          # elfutils: flatpak-builder splits debuginfo with eu-strip.
+          # patch: needed by the manifest's `patch` source type.
+          sudo apt-get install -y --no-install-recommends \
+              flatpak flatpak-builder elfutils patch
           flatpak remote-add --user --if-not-exists \
               flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
