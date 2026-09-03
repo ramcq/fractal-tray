@@ -1,0 +1,171 @@
+name: Build
+
+on:
+  pull_request:
+    paths-ignore: ['**.md', '.gitignore']
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', '.gitignore']
+  workflow_dispatch:
+
+# Never cancel a publishing run; PR builds are fair game.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  APP_ID: org.gnome.Fractal
+  # Same ref as Flathub, so this is a drop-in origin.
+  BRANCH: stable
+  RUNTIME_REPO: https://dl.flathub.org/repo/flathub.flatpakrepo
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # attach the bundle to a release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # The runner has ~13 GB free; the build needs most of it.
+      - name: Reclaim disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
+          df -h /
+
+      - name: Install flatpak
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists \
+              flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      # flatpak-builder installs the runtime and SDK itself, but NOT the
+      # manifest's sdk-extensions, so the Rust extension must be explicit.
+      # See https://github.com/flatpak/flatpak-github-actions/issues/220
+      - name: Install the Rust SDK extension
+        run: |
+          flatpak install --user -y --noninteractive flathub \
+              org.freedesktop.Sdk.Extension.rust-stable//25.08
+
+      - name: Read the Fractal version being built
+        id: version
+        run: |
+          version=$(jq -r '.modules[] | select(.name == "fractal") | .tag' \
+                      "$APP_ID.json")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building Fractal $version"
+
+      # Only publishing runs need the key, so PRs from forks never touch it.
+      - name: Import the signing key
+        if: github.event_name == 'push'
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 -p "$GNUPGHOME"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --homedir "$GNUPGHOME" --batch --quiet --import
+          fpr=$(gpg --homedir "$GNUPGHOME" --list-secret-keys --with-colons \
+                  | awk -F: '/^fpr:/{print $10; exit}')
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "GPG_FINGERPRINT=$fpr" >> "$GITHUB_ENV"
+          echo "Signing with $fpr"
+
+      - name: Build
+        run: |
+          flatpak-builder --user --install-deps-from=flathub \
+              --disable-rofiles-fuse --force-clean \
+              --default-branch="$BRANCH" \
+              ${GPG_FINGERPRINT:+--gpg-sign="$GPG_FINGERPRINT"} \
+              --repo=repo \
+              build-dir "$APP_ID.json"
+
+      - name: Bundle
+        run: |
+          flatpak build-bundle repo fractal-tray.flatpak \
+              "$APP_ID" "$BRANCH" \
+              --runtime-repo="$RUNTIME_REPO" \
+              ${GPG_FINGERPRINT:+--gpg-sign="$GPG_FINGERPRINT"}
+          ls -lh fractal-tray.flatpak
+
+      # Latest commit only: Pages caps a published site at 1 GB and each
+      # commit is ~320 MB. Rollback is served by the release bundles.
+      - name: Finalise the repository
+        if: github.event_name == 'push'
+        run: |
+          flatpak build-update-repo \
+              --generate-static-deltas \
+              --prune --prune-depth=0 \
+              --gpg-sign="$GPG_FINGERPRINT" \
+              repo
+          du -sh repo
+
+      - name: Write index.flatpakrepo
+        if: github.event_name == 'push'
+        run: |
+          cat > repo/index.flatpakrepo <<EOF
+          [Flatpak Repo]
+          Title=Fractal (Tray)
+          Url=https://ramcq.github.io/fractal-tray/
+          Homepage=https://github.com/ramcq/fractal-tray
+          Comment=Unofficial Fractal rebuild with a system tray icon
+          Description=Unofficial rebuild of the Fractal Matrix client with a StatusNotifierItem tray icon. Not affiliated with the Fractal project or GNOME.
+          GPGKey=$(base64 --wrap=0 < fractal-tray.gpg)
+          EOF
+          # Stop Pages' Jekyll from eating the ostree directories.
+          touch repo/.nojekyll
+
+      - name: Upload the Pages artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo
+
+      - name: Publish the bundle as a release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="v${VERSION}-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}"
+          gh release create "$tag" fractal-tray.flatpak \
+            --title "Fractal $VERSION (tray)" \
+            --notes "Unofficial rebuild of Fractal $VERSION with a system tray icon.
+
+          Install this bundle directly:
+
+              flatpak install --user fractal-tray.flatpak
+
+          Or add the remote, which supports \`flatpak update\`:
+
+              flatpak remote-add --user --if-not-exists fractal-tray https://ramcq.github.io/fractal-tray/index.flatpakrepo
+              flatpak install --user fractal-tray org.gnome.Fractal
+
+          Not affiliated with the Fractal project or GNOME."
+
+          # Keep the five most recent bundles.
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[5:] | .[].tagName' \
+            | while read -r old; do
+                [ -n "$old" ] && gh release delete "$old" --yes --cleanup-tag
+              done
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

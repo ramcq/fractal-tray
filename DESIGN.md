@@ -99,9 +99,12 @@ On new upstream commits:
    against the GNOME 49 runtime and libshumate 1.5.
 2. Full-clone Fractal at the new tag (not `--depth 1`, so `git apply -3` has the
    preimage blobs), apply `tray-icon.patch`.
-3. Regenerate `Cargo.lock` with the **SDK's** cargo. Fractal is edition 2024 →
-   resolver 3 → the running toolchain's version affects dependency resolution, so
-   a distro cargo would produce a different lockfile.
+3. Regenerate `Cargo.lock` with the **SDK's** cargo. It is applied with
+   `--exclude=Cargo.lock` and regenerated rather than merged, because the
+   lockfile changes every release and its diff would conflict every time.
+   Regeneration must use the SDK's own cargo: Fractal is edition 2024 →
+   resolver 3 → the running toolchain's version affects dependency resolution,
+   so a distro cargo would produce a different lockfile.
 4. Regenerate `fractal-cargo-sources.json`.
 5. Open a PR with a PAT, **not** `GITHUB_TOKEN` — PRs opened with the default
    token do not trigger workflows, so the build would never run.
@@ -128,8 +131,7 @@ not reset that clock.
 
 | Name | Purpose |
 | --- | --- |
-| `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE` | Single-use signing key, generated for this repo alone |
-| `GPG_FINGERPRINT` | Passed to `build-update-repo --gpg-sign` |
+| `GPG_PRIVATE_KEY` | Single-use RSA-4096 signing key, generated for this repo alone, no expiry |
 | `PR_TOKEN` | Fine-grained PAT, `contents`+`pull-requests` write, this repo — so PRs trigger builds |
 | `ANTHROPIC_API_KEY` | Conflict-resolution agent |
 | `HEALTHCHECKS_URL` | Dead man's switch ping URL |
@@ -137,6 +139,32 @@ not reset that clock.
 A separate fine-grained PAT scoped to `actions: write` on this repo alone lives at
 cron-job.org, so a leak from a free third party buys only the ability to trigger a
 build.
+
+The signing key has **no passphrase**, and its fingerprint is derived in CI from
+the imported key rather than stored. A passphrase held in the same secret store as
+the key it protects buys nothing; the public half is committed as
+`fractal-tray.gpg` so it is auditable, and CI base64-encodes it into
+`index.flatpakrepo`. The key does not expire, because expiry would break client
+verification at an arbitrary future date for no security gain on a
+single-purpose key.
+
+## Inherited from Flathub, deliberately changed
+
+`.github/workflows/update_sources.yaml` is **deleted**. It triggers on pull
+requests touching the manifest and regenerates `fractal-cargo-sources.json` from
+a pristine clone of the pinned tag — i.e. from the *unpatched* `Cargo.lock` —
+which would drop `ksni` from the vendored crates and break the offline build. It
+also pushes to the PR head.
+
+Its trigger is scoped to the `master` and `beta` branches, so on our `main`
+default it would not fire as things stand. It is removed as a latent hazard, not
+an active one: anything that renamed the default branch or added a `master` would
+arm it. A later upstream edit to the file surfaces as a delete/modify conflict;
+keep it deleted.
+
+`update-cargo-sources.sh` is kept as upstream's reference tool but must not be run
+here for the same reason: our vendored list must come from the *patched*
+lockfile. `track-upstream.yml` does that correctly.
 
 ## Ruled out
 

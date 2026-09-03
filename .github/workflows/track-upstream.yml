@@ -1,0 +1,238 @@
+name: Track upstream
+
+# workflow_dispatch only, deliberately. GitHub's 60-day inactivity auto-disable
+# applies solely to workflows with a `schedule` trigger, and upstream went 224
+# days between Fractal 13 and 14. cron-job.org fires this daily; the comparison
+# below decides whether there is anything to do.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/flathub/org.gnome.Fractal.git
+  FRACTAL_GIT: https://gitlab.gnome.org/World/fractal.git
+  MANIFEST: org.gnome.Fractal.json
+  SDK: org.gnome.Sdk//50
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    outputs:
+      needs_help: ${{ steps.refresh.outputs.needs_help }}
+      branch: ${{ steps.merge.outputs.branch }}
+    steps:
+      # PR_TOKEN, not GITHUB_TOKEN: pull requests opened with the default token
+      # do not trigger workflows, so the build would never run on the PR.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PR_TOKEN }}
+
+      - name: Is upstream ahead of us?
+        id: check
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream master
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "Up to date with upstream."
+            echo "ahead=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ahead=true" >> "$GITHUB_OUTPUT"
+            git log --oneline HEAD..upstream/master
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.check.outputs.ahead == 'true'
+        run: |
+          branch="upstream-merge-$(date -u +%Y%m%d)"
+          git switch -c "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+          if git merge --no-edit upstream/master; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            # Leave the conflict in the tree for a human or the agent to resolve.
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U | tee /tmp/conflicts.txt
+          fi
+
+      - name: Install flatpak and the Rust SDK
+        if: steps.merge.outputs.conflict == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak jq
+          flatpak remote-add --user --if-not-exists \
+              flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub \
+              "$SDK" org.freedesktop.Sdk.Extension.rust-stable//25.08
+
+      # Cargo.lock is excluded from the patch application and regenerated
+      # instead: it changes every release, so merging its diff would always
+      # conflict. It must be regenerated with the SDK's own cargo, because
+      # Fractal is edition 2024 (resolver 3), where the running toolchain's
+      # version affects dependency resolution.
+      - name: Refresh the patch against the new Fractal tag
+        id: refresh
+        if: steps.merge.outputs.conflict == 'false'
+        run: |
+          set -o pipefail
+          echo "needs_help=false" >> "$GITHUB_OUTPUT"
+
+          tag=$(jq -r '.modules[] | select(.name=="fractal") | .tag' "$MANIFEST")
+          echo "Fractal tag is now $tag"
+
+          rm -rf /tmp/fractal
+          # Full clone: `git apply -3` needs the preimage blobs present.
+          git clone --quiet --branch "$tag" "$FRACTAL_GIT" /tmp/fractal
+
+          if ! git -C /tmp/fractal apply -3 --exclude=Cargo.lock \
+                 "$GITHUB_WORKSPACE/tray-icon.patch"; then
+            echo "Patch does not apply to $tag." >&2
+            echo "needs_help=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Resolve the lockfile with the toolchain that will build it.
+          flatpak run --devel --share=network --filesystem=/tmp/fractal \
+              --command=sh "$SDK" -c '
+                export PATH=/usr/lib/sdk/rust-stable/bin:$PATH
+                export CARGO_HOME=/tmp/fractal/.cargo-home
+                cd /tmp/fractal && cargo metadata --format-version 1 >/dev/null
+              '
+          rm -rf /tmp/fractal/.cargo-home
+
+          git -C /tmp/fractal add -N src/tray
+          git -C /tmp/fractal diff > "$GITHUB_WORKSPACE/tray-icon.patch"
+
+          # Regenerate the vendored crate list from the new lockfile.
+          git clone --quiet --depth 1 \
+              https://github.com/flatpak/flatpak-builder-tools.git /tmp/fbt
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip -q install tomlkit aiohttp
+          /tmp/venv/bin/python /tmp/fbt/cargo/flatpak-cargo-generator.py \
+              /tmp/fractal/Cargo.lock -o fractal-cargo-sources.json
+
+          git add tray-icon.patch fractal-cargo-sources.json
+          git commit -q -m "Refresh tray patch and cargo sources for Fractal $tag" \
+            || echo "Nothing to refresh."
+
+      - name: Push the branch
+        if: steps.check.outputs.ahead == 'true'
+        run: git push --force-with-lease origin HEAD
+
+      - name: Open the pull request
+        if: steps.check.outputs.ahead == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PR_TOKEN }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+          NEEDS_HELP: ${{ steps.refresh.outputs.needs_help }}
+        run: |
+          if [ "$CONFLICT" = "true" ] || [ "$NEEDS_HELP" = "true" ]; then
+            draft=--draft
+            if [ "$CONFLICT" = "true" ]; then
+              body="The merge of \`upstream/master\` conflicted. Conflicting files are left unresolved on this branch.
+
+          \`Cargo.lock\` and \`fractal-cargo-sources.json\` have **not** been regenerated yet."
+            else
+              body="\`tray-icon.patch\` no longer applies to the new Fractal tag.
+
+          \`Cargo.lock\` and \`fractal-cargo-sources.json\` have **not** been regenerated yet — rerun this workflow once the patch applies and it will finish the mechanical work."
+            fi
+          else
+            draft=""
+            body="Merged \`upstream/master\`, refreshed \`tray-icon.patch\` against the new Fractal tag, and regenerated \`Cargo.lock\` and \`fractal-cargo-sources.json\`.
+
+          Merging publishes to the remote."
+          fi
+
+          # --repo and --base are explicit on purpose. This repository is not a
+          # GitHub fork, but never let a PR default anywhere near Flathub's repo.
+          gh pr create \
+            --repo ramcq/fractal-tray --base main --head "$BRANCH" \
+            $draft \
+            --title "Merge upstream Flathub changes" \
+            --body "$body"
+
+  # Only runs when the deterministic path could not finish.
+  resolve:
+    needs: track
+    if: needs.track.outputs.needs_help == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.track.outputs.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.PR_TOKEN }}
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.PR_TOKEN }}
+          claude_args: '--allowedTools "Bash,Read,Edit,Write,Grep,Glob"'
+          prompt: |
+            `tray-icon.patch` in this repository no longer applies to the Fractal
+            version pinned in `org.gnome.Fractal.json`. Update the patch so it
+            applies cleanly again.
+
+            Read DESIGN.md first — it explains what the patch does and which
+            parts are load-bearing.
+
+            Method: read the pinned `fractal` tag from the manifest, clone
+            `https://gitlab.gnome.org/World/fractal.git` at that tag (a full
+            clone, so `git apply -3` has the preimage blobs), and work out how
+            upstream's changes collide with the patch. Reconcile the patch's
+            intent against the new upstream code, then regenerate the patch file
+            with `git diff` (remember `git add -N src/tray` so the new files are
+            included). Exclude `Cargo.lock` from your patch application; it is
+            regenerated separately.
+
+            Constraints, which matter more than finishing:
+
+            - Do NOT invent a resolution you are not confident in. If upstream
+              has restructured something the patch depends on — the window's
+              `close_request` handling, `present_main_window`, the session list,
+              the notification-count plumbing — and you cannot map the patch's
+              intent onto it with confidence, then STOP, leave the patch as close
+              to correct as you can, and say plainly in a PR comment what you
+              could not reconcile and why. A partial patch with an honest
+              account is far more useful than a plausible-looking wrong one.
+            - This is a Matrix client. A wrong change can affect end-to-end
+              encryption state and message history, and a green Flatpak build
+              does not demonstrate correct behaviour.
+            - Do not change what the patch does. You are reconciling it with
+              upstream, not redesigning it.
+            - Leave `Cargo.lock` and `fractal-cargo-sources.json` alone. Say in
+              your comment that they still need regenerating by rerunning the
+              Track upstream workflow.
+
+            Commit your changes to this branch and comment on the pull request
+            explaining what you changed and what remains.
+
+  # The dominant failure mode of this pipeline is silence, and GitHub has no
+  # "workflow has not run in N days" signal. This is the dead man's switch.
+  heartbeat:
+    needs: track
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping healthchecks.io
+        env:
+          URL: ${{ secrets.HEALTHCHECKS_URL }}
+        run: |
+          [ -z "$URL" ] && { echo "No HEALTHCHECKS_URL set; skipping."; exit 0; }
+          if [ "${{ needs.track.result }}" = "success" ]; then
+            curl -fsS -m 10 --retry 5 "$URL" && echo " ok"
+          else
+            curl -fsS -m 10 --retry 5 "$URL/fail" && echo " reported failure"
+          fi
