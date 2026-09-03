@@ -36,8 +36,18 @@ jobs:
       contents: write        # attach the bundle to a release
     outputs:
       version: ${{ steps.version.outputs.version }}
+    # The image has no /usr/bin/bash, so GitHub falls back to `sh`, which
+    # breaks bashisms like ${GITHUB_SHA:0:7}. bash is present on PATH.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
+
+      # The workspace is owned by a different uid than the container's root,
+      # and gh shells out to git to identify the repository.
+      - name: Mark the workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # The image ships the base SDK only; flatpak-builder does not install a
       # manifest's sdk-extensions itself.
@@ -52,7 +62,10 @@ jobs:
       - name: Read the Fractal version being built
         id: version
         run: |
-          version=$(jq -r '.modules[] | select(.name == "fractal") | .tag' \
+          # `tag` lives on the module's git source, not on the module.
+          version=$(jq -r '[.modules[] | select(.name == "fractal") | .sources[]
+                           | select((type == "object") and (.type == "git")) | .tag]
+                          | first' \
                       "$APP_ID.json")
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building Fractal $version"
@@ -127,7 +140,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           tag="v${VERSION}-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}"
-          gh release create "$tag" fractal-tray.flatpak \
+          gh release create --repo "$GITHUB_REPOSITORY" "$tag" fractal-tray.flatpak \
             --title "Fractal $VERSION (tray)" \
             --notes "Unofficial rebuild of Fractal $VERSION with a system tray icon.
 
@@ -143,10 +156,10 @@ jobs:
           Not affiliated with the Fractal project or GNOME."
 
           # Keep the five most recent bundles.
-          gh release list --limit 100 --json tagName,createdAt \
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
             --jq 'sort_by(.createdAt) | reverse | .[5:] | .[].tagName' \
             | while read -r old; do
-                [ -n "$old" ] && gh release delete "$old" --yes --cleanup-tag
+                [ -n "$old" ] && gh release delete --repo "$GITHUB_REPOSITORY" "$old" --yes --cleanup-tag
               done
 
   deploy:

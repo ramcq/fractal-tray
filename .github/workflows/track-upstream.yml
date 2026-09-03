@@ -83,7 +83,10 @@ jobs:
           set -o pipefail
           echo "needs_help=false" >> "$GITHUB_OUTPUT"
 
-          tag=$(jq -r '.modules[] | select(.name=="fractal") | .tag' "$MANIFEST")
+          # `tag` lives on the module's git source, not on the module.
+          tag=$(jq -r '[.modules[] | select(.name == "fractal") | .sources[]
+                           | select((type == "object") and (.type == "git")) | .tag]
+                          | first' "$MANIFEST")
           echo "Fractal tag is now $tag"
 
           rm -rf /tmp/fractal
