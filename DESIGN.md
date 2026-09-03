@@ -61,9 +61,25 @@ would raise conflict odds for no benefit. Non-English locales still show
 ## Build and publish
 
 `build.yml`, in `ghcr.io/flathub-infra/flatpak-github-actions:gnome-50` with
-`--privileged`. That image carries the base SDK only, so the workflow installs
+`--privileged`.
+
+The image, rather than plain `ubuntu-latest`, is load-bearing. Ubuntu 24.04 ships
+**flatpak-builder 1.4.2**, under which meson's default `libdir` becomes `lib64`,
+so libshumate installs `shumate-1.0.pc` to `/app/lib64/pkgconfig` — off
+pkg-config's path — and the `fractal` module then fails with `Dependency
+"shumate-1.0" not found`. The image carries **1.4.9**, which yields `/app/lib`.
+The manifest is left byte-identical to Flathub's rather than papered over with a
+`--libdir` config-opt: this build should be what Flathub builds, plus the patch.
+
+The image carries the base SDK only, so the workflow installs
 `org.freedesktop.Sdk.Extension.rust-stable//25.08` explicitly — flatpak-builder
-does not auto-install `sdk-extensions`.
+does not auto-install `sdk-extensions`. The branch is **25.08, not 50**:
+`org.gnome.Sdk//50` declares `version = 25.08` on its
+`org.freedesktop.Sdk.Extension` point, and no `rust-stable//50` exists.
+
+Runner disk is not a constraint despite GitHub documenting "14 GB SSD" — current
+`ubuntu-latest` runners report 145 GB total with ~86 GB free, against a 5.8 GB
+image and a ~5 GB build.
 
 * `pull_request`: build only.
 * `push` to `main`: build, GPG-sign, publish.
@@ -75,8 +91,10 @@ without `sccache` and a manifest that diverges from the one Flathub can build.
 Expect ~2 hours; free on a public repository.
 
 Publish is inlined shell rather than a third-party action: `build-export` →
-`build-update-repo --prune --prune-depth=0 --generate-static-deltas` →
-`index.flatpakrepo` → `upload-pages-artifact` / `deploy-pages`. Latest commit
+`build-update-repo --prune --prune-depth=0` → `index.flatpakrepo` →
+`upload-pages-artifact` / `deploy-pages`. No `--generate-static-deltas`: deltas
+exist to speed transfers *between* commits, and only one commit is ever kept, so
+they would inflate the repo for nothing. Latest commit
 only; rollback is served by `.flatpak` bundles attached to releases, which is
 both simpler and more useful than ostree history a reader would have to pin by
 commit.

@@ -25,6 +25,13 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Flathub's own build image. Ubuntu's flatpak-builder is 1.4.2, which
+    # changes meson's default libdir to lib64 and leaves shumate-1.0.pc off
+    # pkg-config's path. This image carries 1.4.9, plus jq, gh, eu-strip and
+    # the GNOME 50 Platform and SDK.
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
     permissions:
       contents: write        # attach the bundle to a release
     outputs:
@@ -32,29 +39,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The runner has ~13 GB free; the build needs most of it.
-      - name: Reclaim disk space
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-                      /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
-          df -h /
-
-      - name: Install flatpak
-        run: |
-          sudo apt-get update
-          # elfutils: flatpak-builder splits debuginfo with eu-strip.
-          # patch: needed by the manifest's `patch` source type.
-          sudo apt-get install -y --no-install-recommends \
-              flatpak flatpak-builder elfutils patch
-          flatpak remote-add --user --if-not-exists \
-              flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-
-      # flatpak-builder installs the runtime and SDK itself, but NOT the
-      # manifest's sdk-extensions, so the Rust extension must be explicit.
+      # The image ships the base SDK only; flatpak-builder does not install a
+      # manifest's sdk-extensions itself.
       # See https://github.com/flatpak/flatpak-github-actions/issues/220
+      # The branch is 25.08, not 50: org.gnome.Sdk//50 declares
+      # `version = 25.08` on its org.freedesktop.Sdk.Extension point.
       - name: Install the Rust SDK extension
         run: |
-          flatpak install --user -y --noninteractive flathub \
+          flatpak install -y --noninteractive flathub \
               org.freedesktop.Sdk.Extension.rust-stable//25.08
 
       - name: Read the Fractal version being built
@@ -82,8 +74,7 @@ jobs:
 
       - name: Build
         run: |
-          flatpak-builder --user --install-deps-from=flathub \
-              --disable-rofiles-fuse --force-clean \
+          flatpak-builder --disable-rofiles-fuse --force-clean \
               --default-branch="$BRANCH" \
               ${GPG_FINGERPRINT:+--gpg-sign="$GPG_FINGERPRINT"} \
               --repo=repo \
@@ -103,7 +94,6 @@ jobs:
         if: github.event_name == 'push'
         run: |
           flatpak build-update-repo \
-              --generate-static-deltas \
               --prune --prune-depth=0 \
               --gpg-sign="$GPG_FINGERPRINT" \
               repo
